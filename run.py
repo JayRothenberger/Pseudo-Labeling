@@ -38,6 +38,7 @@ from distances import pairwise_cosine, pairwise_euclidean_dist, pairwise_JS, pai
 from distances import query
 import flash
 from DAHB import DistributedAsynchronousHyperBand, DistributedAsynchronousGridSearch
+from dataset_utils import find_closest_batch, add_to_imagefolder
 
 DIST_MAP = {
     'cosine': pairwise_cosine,
@@ -46,66 +47,6 @@ DIST_MAP = {
     'JS': pairwise_JS,
     'KL': pairwise_KL
 }
-
-def find_closest_batch(loader1, loader2, distance, m=1, nearest_neighbors=1):
-    """
-    find the closest examples in loader2 to any example(s) in loader 1, where "closest" is the sum of squared distance of the "nearest_neighbors" nearest neighbors
-
-    :DataLoader loader1: data loader object - unshuffled
-    :DataLoader loader2: data loader object - unshuffled
-    :callable distance: symmetric two argument distance function
-    :int m: number of closest examples to return (returned in distance order)
-    :int nearest_neighbors: strictly positive number of neighbors to compute for
-
-    :return: List of (index, distance) tuples
-    """
-    outers, inners, computes = 0, 0, 0
-    outer, inner, compute = 0, 0, 0
-    sum_squared_distances = []
-    start_outer = time.time()
-    for i, (x2, y2) in enumerate(loader2):
-        start_inner = time.time()
-        print(i, end='\r')
-        # to hold distances
-        distances = []
-        for j, (x1, y1) in enumerate(loader1):
-            print(i, j, end='      \r')
-            start_compute = time.time()
-            # beware this line is not symmetric
-            distances.append(distance(x2, x1))
-            end_compute = time.time()
-            compute += end_compute - start_compute
-            computes += 1
-        distances = torch.concat(distances, 0)
-        distances, indices = torch.sort(distances, 0)
-        sum_squared_distances.append(torch.sum(distances[:nearest_neighbors], 0))
-        end_inner = time.time()
-        inner += end_inner - start_inner
-        inners += 1
-    end_outer = time.time()
-    outer += end_outer - start_outer
-    outers += 1
-    print(f'outer: {outer - inner - compute}, inner: {inner - compute}, compute: {compute}')
-    print(torch.concat(sum_squared_distances, 0).shape)
-    values, indices = torch.sort(torch.concat(sum_squared_distances, 0), 0)
-    return list(zip(values, indices))[:m]
-
-
-def add_to_imagefolder(paths, labels, dataset):
-    """
-    Adds the paths with the labels to an image classification dataset
-
-    :list paths: a list of absolute image paths to add to the dataset
-    :list labels: a list of labels for each path
-    :Dataset dataset: the dataset to add the samples to
-    """
-
-    new_samples = list(zip(paths, labels))
-
-    dataset.samples += new_samples
-
-    return dataset
-
 
 def setup(rank, world_size):
     dist.init_process_group("nccl", rank=rank, world_size=world_size)
@@ -141,30 +82,6 @@ def train(args, model, rank, world_size, train_loader, optimizer, epoch, sampler
 
     if rank == 0:
         print('Train Epoch: {} \tLoss: {:.6f}'.format(epoch, ddp_loss[0] / ddp_loss[1]))
-
-def test(model, rank, world_size, test_loader):
-    model.eval()
-    loss_fn = torch.nn.CrossEntropyLoss()
-    correct = 0
-    ddp_loss = torch.zeros(3).to(rank % torch.cuda.device_count())
-    with torch.no_grad():
-        for data, target in test_loader:
-            data, target = data.to(rank % torch.cuda.device_count()), target.to(rank % torch.cuda.device_count())
-            output = model(data)
-            ddp_loss[0] += loss_fn(output, target).item()  # sum up batch loss
-            pred = output.argmax(dim=1, keepdim=True)  # get the index of the max log-probability
-            ddp_loss[1] += pred.eq(target.view_as(pred)).sum().item()
-            ddp_loss[2] += len(data)
-
-    dist.all_reduce(ddp_loss, op=dist.ReduceOp.SUM)
-
-    if int(os.environ["RANK"]) == 0:
-        test_loss = ddp_loss[0] / ddp_loss[2]
-        print('Test set: Average loss: {:.4f}, Accuracy: {}/{} ({:.2f}%) :)\n'.format(
-            test_loss, int(ddp_loss[1]), int(ddp_loss[2]),
-            100. * ddp_loss[1] / ddp_loss[2]))
-    
-    return ddp_loss[0] / ddp_loss[2]
 
 
 def train_pl(args, model, rank, world_size, train_loader, pseudo_loader, optimizer, epoch, sampler=None, weight=1.0):
@@ -210,6 +127,7 @@ def train_pl(args, model, rank, world_size, train_loader, pseudo_loader, optimiz
 
     if rank == 0:
         print('Train Epoch: {} \tLoss: {:.6f}'.format(epoch, ddp_loss[0] / ddp_loss[1]))
+
 
 def test(model, rank, world_size, test_loader):
     model.eval()
