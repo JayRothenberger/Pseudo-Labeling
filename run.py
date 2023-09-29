@@ -37,7 +37,8 @@ from torch.distributed.fsdp.wrap import (
 from distances import pairwise_cosine, pairwise_euclidean_dist, pairwise_JS, pairwise_l1_dist, pairwise_KL
 from distances import query
 import flash
-from DAHB import DistributedAsynchronousHyperBand, DistributedAsynchronousGridSearch
+from DAHS.DAHB import DistributedAsynchronousHyperBand, DistributedAsynchronousGridSearch
+from DAHS.torch_utils import sync_parameters
 from dataset_utils import find_closest_batch, add_to_imagefolder
 
 DIST_MAP = {
@@ -472,6 +473,7 @@ def training_process(rank, world_size, args, states):
 
     return states, watching
 
+
 def fsdp_main(rank, world_size, args):
 
     setup(rank, world_size)
@@ -481,52 +483,15 @@ def fsdp_main(rank, world_size, args):
     
     args.pseudo_weight = [0.5, 0.25, 0.125, 2**(-4)]
     args.oracle = [True, False]
-    # args.from_embed = ['DINOv2', 'CLIP', 'SwAV', 'EsViT', 'Hist']
     args.from_embed = ['SwAV', 'Hist']
-    # args.from_embed = ['SwAV']
     args.pretrained = [True, False]
 
     search_space = ['pseudo_weight', 'oracle', 'from_embed', 'pretrained']
 
-    path = args.path
-    k = 4
+    agent = sync_parameters(args, rank, search_space, DistributedAsynchronousGridSearch)
 
-    # sync parameters between ranks
-    # 1. create the agent
-    if rank == 0:
-        try:
-            agent = DistributedAsynchronousGridSearch(path, search_space, args)
-        except SystemError as e:
-            time.sleep(random.randrange(0, 60))
-            agent = DistributedAsynchronousGridSearch(path, search_space, args)
-    # 2. generate and broadcast a unique integer - this will specify a path
-    # broadcast the integer
-    agree = random.randrange(0, 2**32)
-    agree = torch.Tensor([agree]).to(rank % torch.cuda.device_count())
-
-    torch.distributed.broadcast(agree, 0)
-    torch.distributed.all_reduce(agree)
-    agree = int(agree.cpu()[0])
-
-    if rank == 0:
-        try:
-            os.mkdir(os.path.join(path, f'{agree}'))
-        except Exception as e:
-            print(e)
-        print(path)
-        with open(os.path.join(path, f'{agree}/hparams.pkl'), 'wb') as fp:
-            pickle.dump(agent, fp)
-    else:
-        time.sleep(20)
-
-    # load the mutual file
-    with open(os.path.join(path, f'{agree}/hparams.pkl'), 'rb') as fp:
-        agent = pickle.load(fp)
-
-
-    print('setting namespace')
     args = agent.to_namespace(agent.combination)
-    print('loading state')
+
     try:
         states = torch.load(agent.path)
         print(agent.path)
@@ -536,7 +501,6 @@ def fsdp_main(rank, world_size, args):
 
     states, metric = training_process(rank, world_size, args, states)
 
-    print(agent.path)
     if rank == 0:
         print('saving checkpoint')
         agent.save_checkpoint(states)
